@@ -1,0 +1,22 @@
+# ── API & environment ──────────────────────────────────────────────────────────
+requests==2.32.3
+python-dotenv==1.0.1
+
+# ── Data wrangling ─────────────────────────────────────────────────────────────
+pandas==2.2.2
+numpy==2.0.1
+
+# ── Visualization ──────────────────────────────────────────────────────────────
+matplotlib==3.9.1
+seaborn==0.13.2
+plotly==5.23.0
+
+# ── Jupyter (interactive analysis) ────────────────────────────────────────────
+jupyter==1.0.0
+ipykernel==6.29.5
+
+# ── Machine learning (delay prediction) ───────────────────────────────────────
+scikit-learn==1.5.1
+
+# ── XML parsing (DB API returns XML) ──────────────────────────────────────────
+lxml==5.2.2

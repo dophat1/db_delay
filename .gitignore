@@ -1,0 +1,11 @@
+# Credentials - never commit these
+.env
+
+# Scraped data (can be large)
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
