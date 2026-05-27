@@ -1,29 +1,52 @@
 """
 Deutsche Bahn Real-Time Delay Scraper
-Uses v5.db.transport.rest (no API key needed)
+Uses the official DB Timetables API (developers.deutschebahn.com)
 
-Usage:
-  python db_delay_scraper.py                        # scrape once, save to db_delays.csv
-  python db_delay_scraper.py --loop 5               # scrape every 5 minutes continuously
-  python db_delay_scraper.py --stations 8000261 8000105   # custom stations
-  python db_delay_scraper.py --search "Augsburg"    # find station IDs by name
+HOW TO GET CREDENTIALS:
+  1. Register at https://developers.deutschebahn.com
+  2. Create an app at https://developers.deutschebahn.com/db-api-marketplace/apis/application/new
+  3. Go to https://developers.deutschebahn.com/db-api-marketplace/apis/product
+  4. Select "Timetables" → click Subscribe → choose your app
+  5. Copy your Client ID and Client Secret below (or set as env vars)
+
+HOW IT WORKS:
+  The API works in two steps per station:
+    1. GET /plan/{evaNo}/{date}/{hour}  → planned timetable (static, per hour)
+    2. GET /fchg/{evaNo}               → full changes (delays, cancellations, platform changes)
+  We merge them by trip ID to compute actual delays.
+
+USAGE:
+  pip install requests
+  python db_delay_scraper.py                           # scrape current hour
+  python db_delay_scraper.py --loop 2                  # repeat every 2 minutes
+  python db_delay_scraper.py --stations 8000261 8000068 --hours 2
+  python db_delay_scraper.py --search "Augsburg"       # find evaNo by name
 """
 
-import requests
+import os
+import re
 import csv
 import time
 import argparse
-from datetime import datetime, timezone
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone, timedelta
 
-BASE_URL = "https://v5.db.transport.rest"
+import requests
+from dotenv import load_dotenv
 
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "db-delay-scraper/1.0 (personal research)",
-    "Accept": "application/json",
-})
+load_dotenv()  # reads .env if present, falls back to real env vars
 
-# Some well-known station IDs to get you started
+# ── Credentials ────────────────────────────────────────────────────────────────
+CLIENT_ID     = os.getenv("DB_CLIENT_ID")
+CLIENT_SECRET = os.getenv("DB_CLIENT_SECRET")
+
+if not CLIENT_ID or not CLIENT_SECRET:
+    raise EnvironmentError(
+        "Missing credentials. Copy .env.example → .env and fill in your keys."
+    )
+BASE_URL      = "https://apis.deutschebahn.com/db-api-marketplace/apis/timetables/v1"
+
+# ── Well-known stations (evaNo → name) ────────────────────────────────────────
 DEFAULT_STATIONS = {
     "8000261": "München Hbf",
     "8000105": "Frankfurt(Main)Hbf",
@@ -34,157 +57,237 @@ DEFAULT_STATIONS = {
 }
 
 CSV_FIELDS = [
-    "scraped_at",
-    "station_id",
-    "station_name",
-    "train_id",
-    "line_name",
-    "product",        # nationalExpress (ICE), national (IC), regional, suburban (S-Bahn)
-    "direction",
-    "planned_when",
-    "actual_when",
-    "delay_seconds",
-    "delay_minutes",
-    "platform",
-    "planned_platform",
-    "cancelled",
-    "remarks",
+    "scraped_at", "station_eva", "station_name",
+    "trip_id", "train_name", "train_type",
+    "planned_departure", "actual_departure", "dep_delay_min",
+    "planned_arrival",   "actual_arrival",   "arr_delay_min",
+    "planned_platform", "actual_platform",
+    "planned_path", "changed_path",
+    "cancelled", "messages",
 ]
 
+# ── Auth session ───────────────────────────────────────────────────────────────
+def make_session():
+    s = requests.Session()
+    s.headers.update({
+        "DB-Client-Id":     CLIENT_ID,
+        "DB-Api-Key":       CLIENT_SECRET,   # some versions use this header
+        "Accept":           "application/xml",
+    })
+    return s
 
-def search_stations(query: str):
-    """Search for stations by name and print their IDs."""
-    print(f"\nSearching for stations matching '{query}'...")
-    resp = SESSION.get(
-        f"{BASE_URL}/locations",
-        params={"query": query, "results": 10, "stops": "true", "addresses": "false", "poi": "false"},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    results = resp.json()
-    if not results:
-        print("No stations found.")
+SESSION = make_session()
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def parse_pt(val: str | None) -> str | None:
+    """Convert DB time format YYMMDDHHmm → ISO-like string, or None."""
+    if not val or len(val) < 10:
+        return val
+    try:
+        dt = datetime.strptime(val, "%y%m%d%H%M")
+        return dt.strftime("%Y-%m-%dT%H:%M")
+    except ValueError:
+        return val
+
+def delay_minutes(planned: str | None, actual: str | None) -> float | None:
+    """Return delay in minutes between two YYMMDDHHmm strings."""
+    if not planned or not actual:
+        return None
+    try:
+        fmt = "%y%m%d%H%M"
+        p = datetime.strptime(planned, fmt)
+        a = datetime.strptime(actual, fmt)
+        return round((a - p).total_seconds() / 60, 1)
+    except ValueError:
+        return None
+
+def get_xml(url: str) -> ET.Element | None:
+    try:
+        r = SESSION.get(url, timeout=15)
+        r.raise_for_status()
+        return ET.fromstring(r.text)
+    except requests.HTTPError as e:
+        print(f"    HTTP {e.response.status_code}: {url}")
+        return None
+    except Exception as e:
+        print(f"    Error: {e}")
+        return None
+
+# ── API calls ─────────────────────────────────────────────────────────────────
+def search_stations(pattern: str):
+    """Print stations matching a name pattern."""
+    url = f"{BASE_URL}/station/{pattern}"
+    root = get_xml(url)
+    if root is None:
         return
-    print(f"{'ID':<12} {'Name'}")
+    print(f"\n{'evaNo':<12} Name")
     print("-" * 50)
-    for r in results:
-        if r.get("type") in ("stop", "station"):
-            print(f"{r['id']:<12} {r['name']}")
+    for s in root.findall(".//station"):  # or 'station' depending on schema
+        print(f"{s.get('eva', s.get('evaNo','?')):<12} {s.get('name','?')}")
 
+def fetch_plan(eva: str, date_str: str, hour: str) -> dict:
+    """Fetch planned timetable for one station/hour. Returns {trip_id: stop_el}."""
+    url = f"{BASE_URL}/plan/{eva}/{date_str}/{hour}"
+    root = get_xml(url)
+    plan = {}
+    if root is None:
+        return plan
+    for s in root.findall("s"):   # <s> = stop element
+        trip_id = s.get("id", "")
+        plan[trip_id] = s
+    return plan
 
-def fetch_departures(station_id: str, duration: int = 60, results: int = 100) -> list[dict]:
-    """Fetch departures for a station. Returns list of raw departure dicts."""
-    resp = SESSION.get(
-        f"{BASE_URL}/stops/{station_id}/departures",
-        params={
-            "duration": duration,   # minutes window to look ahead
-            "results": results,
-            "language": "en",
-        },
-        timeout=15,
-    )
-    resp.raise_for_status()
-    return resp.json()
+def fetch_changes(eva: str) -> dict:
+    """Fetch full changes (delays). Returns {trip_id: stop_el}."""
+    url = f"{BASE_URL}/fchg/{eva}"
+    root = get_xml(url)
+    changes = {}
+    if root is None:
+        return changes
+    for s in root.findall("s"):
+        trip_id = s.get("id", "")
+        changes[trip_id] = s
+    return changes
 
+# ── Merge plan + changes into CSV rows ────────────────────────────────────────
+def merge_to_rows(eva: str, name: str, plan: dict, changes: dict, scraped_at: str) -> list[dict]:
+    rows = []
+    for trip_id, stop in plan.items():
+        chg = changes.get(trip_id)
 
-def parse_departure(dep: dict, station_id: str, station_name: str, scraped_at: str) -> dict:
-    """Flatten a departure JSON object into a CSV row."""
-    delay_sec = dep.get("delay")  # delay in seconds (None if unknown)
-    delay_min = round(delay_sec / 60, 1) if delay_sec is not None else None
+        tl = stop.find("tl")   # train line element
+        dp = stop.find("dp")   # departure
+        ar = stop.find("ar")   # arrival
 
-    remarks = "; ".join(
-        r.get("text", "") or r.get("summary", "")
-        for r in (dep.get("remarks") or [])
-        if r.get("type") in ("warning", "status", "hint")
-    )
+        # planned values
+        p_dep  = dp.get("pt") if dp is not None else None
+        p_arr  = ar.get("pt") if ar is not None else None
+        p_dplf = dp.get("pp") if dp is not None else None   # planned platform
+        p_arplf= ar.get("pp") if ar is not None else None
+        p_dpth = dp.get("ppth") if dp is not None else None  # planned path
 
-    line = dep.get("line") or {}
+        # changed values (from fchg)
+        c_dep = c_arr = c_dplf = c_arplf = c_dpth = None
+        cancelled = False
+        messages = []
 
-    return {
-        "scraped_at": scraped_at,
-        "station_id": station_id,
-        "station_name": station_name,
-        "train_id": dep.get("tripId", ""),
-        "line_name": line.get("name", ""),
-        "product": line.get("product", ""),
-        "direction": dep.get("direction", ""),
-        "planned_when": dep.get("plannedWhen", ""),
-        "actual_when": dep.get("when", ""),          # None if cancelled
-        "delay_seconds": delay_sec,
-        "delay_minutes": delay_min,
-        "platform": dep.get("platform", ""),
-        "planned_platform": dep.get("plannedPlatform", ""),
-        "cancelled": dep.get("cancelled", False),
-        "remarks": remarks,
-    }
+        if chg is not None:
+            c_dp = chg.find("dp")
+            c_ar = chg.find("ar")
+            if c_dp is not None:
+                c_dep  = c_dp.get("ct")  # changed time
+                c_dplf = c_dp.get("cp")  # changed platform
+                c_dpth = c_dp.get("cpth")
+                if c_dp.get("cs") == "c":
+                    cancelled = True
+            if c_ar is not None:
+                c_arr  = c_ar.get("ct")
+                c_arplf= c_ar.get("cp")
+                if c_ar.get("cs") == "c":
+                    cancelled = True
+            for m in chg.findall("m"):
+                txt = m.get("t") or m.get("c") or ""
+                if txt:
+                    messages.append(txt)
 
+        # train name: e.g. "ICE 702"
+        train_cat  = tl.get("c", "") if tl is not None else ""   # category e.g. ICE
+        train_no   = tl.get("n", "") if tl is not None else ""   # number e.g. 702
+        train_name = f"{train_cat} {train_no}".strip()
 
-def scrape_to_csv(
-    station_ids: list[str],
-    output_file: str = "db_delays.csv",
-    append: bool = False,
-):
-    """Scrape all given stations and write results to CSV."""
-    mode = "a" if append else "w"
-    write_header = not append
+        rows.append({
+            "scraped_at":       scraped_at,
+            "station_eva":      eva,
+            "station_name":     name,
+            "trip_id":          trip_id,
+            "train_name":       train_name,
+            "train_type":       train_cat,
+            "planned_departure": parse_pt(p_dep),
+            "actual_departure":  parse_pt(c_dep) if c_dep else parse_pt(p_dep),
+            "dep_delay_min":     delay_minutes(p_dep, c_dep),
+            "planned_arrival":   parse_pt(p_arr),
+            "actual_arrival":    parse_pt(c_arr) if c_arr else parse_pt(p_arr),
+            "arr_delay_min":     delay_minutes(p_arr, c_arr),
+            "planned_platform":  p_dplf or p_arplf or "",
+            "actual_platform":   c_dplf or c_arplf or "",
+            "planned_path":      p_dpth or "",
+            "changed_path":      c_dpth or "",
+            "cancelled":         cancelled,
+            "messages":          "; ".join(messages),
+        })
+    return rows
 
-    rows_written = 0
+# ── Main scrape loop ──────────────────────────────────────────────────────────
+def scrape(station_ids: list, hours_ahead: int, output: str, append: bool):
+    os.makedirs(os.path.dirname(output), exist_ok=True)  # ← add this
+
+    now = datetime.now()
     scraped_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    mode = "a" if append else "w"
+    total = 0
 
-    with open(output_file, mode, newline="", encoding="utf-8") as f:
+    with open(output, mode, newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        if write_header:
+        if not append:
             writer.writeheader()
 
-        for station_id in station_ids:
-            station_name = DEFAULT_STATIONS.get(station_id, station_id)
-            print(f"  Fetching {station_name} ({station_id})...", end=" ")
-            try:
-                departures = fetch_departures(station_id)
-                for dep in departures:
-                    row = parse_departure(dep, station_id, station_name, scraped_at)
-                    writer.writerow(row)
-                    rows_written += 1
-                print(f"{len(departures)} departures")
-            except requests.HTTPError as e:
-                print(f"HTTP error: {e}")
-            except requests.RequestException as e:
-                print(f"Request error: {e}")
-            time.sleep(0.5)  # be polite between stations
+        for eva in station_ids:
+            name = DEFAULT_STATIONS.get(eva, eva)
+            print(f"  {name} ({eva})")
 
-    return rows_written
+            # fetch changes once per station (covers all hours)
+            changes = fetch_changes(eva)
+
+            # fetch plan for each requested hour
+            all_plan = {}
+            for h in range(hours_ahead):
+                t = now + timedelta(hours=h)
+                date_str = t.strftime("%y%m%d")   # YYMMDD
+                hour_str = t.strftime("%H")
+                plan_slice = fetch_plan(eva, date_str, hour_str)
+                all_plan.update(plan_slice)
+                time.sleep(0.5)
+
+            rows = merge_to_rows(eva, name, all_plan, changes, scraped_at)
+            writer.writerows(rows)
+            total += len(rows)
+            delayed = sum(1 for r in rows if r["dep_delay_min"] and float(r["dep_delay_min"]) > 0)
+            cancelled = sum(1 for r in rows if r["cancelled"])
+            print(f"    → {len(rows)} trips, {delayed} delayed, {cancelled} cancelled")
+            time.sleep(1)
+
+    return total
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Scrape Deutsche Bahn real-time delays to CSV")
-    parser.add_argument("--stations", nargs="+", default=list(DEFAULT_STATIONS.keys()),
-                        help="Station IDs to scrape (default: 6 major Hbfs)")
-    parser.add_argument("--output", default="db_delays.csv", help="Output CSV file")
+    parser = argparse.ArgumentParser(description="DB Timetables API → CSV delay scraper")
+    parser.add_argument("--stations", nargs="+", default=list(DEFAULT_STATIONS.keys()))
+    parser.add_argument("--output", default=os.path.join(os.path.dirname(__file__), "data", f"db_delays_{datetime.now().strftime('%d%m%y')}.csv"))
+    parser.add_argument("--hours", type=int, default=2,
+                        help="How many hours ahead to fetch planned data (default: 2)")
     parser.add_argument("--loop", type=int, default=0, metavar="MINUTES",
-                        help="Run in loop every N minutes (0 = run once)")
-    parser.add_argument("--search", metavar="QUERY",
-                        help="Search for station names/IDs and exit")
+                        help="Repeat every N minutes, appending rows (0 = run once)")
+    parser.add_argument("--search", metavar="NAME",
+                        help="Search for a station evaNo by name and exit")
     args = parser.parse_args()
 
     if args.search:
         search_stations(args.search)
         return
 
-    print(f"Stations: {', '.join(args.stations)}")
-    print(f"Output:   {args.output}")
+    print(f"Output: {args.output} | Stations: {len(args.stations)} | Hours ahead: {args.hours}")
 
     if args.loop:
-        print(f"Loop mode: every {args.loop} minutes. Press Ctrl+C to stop.\n")
+        print(f"Loop mode: every {args.loop} min. Ctrl+C to stop.\n")
         run = 0
         while True:
             run += 1
             print(f"[Run #{run}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            n = scrape_to_csv(args.stations, args.output, append=(run > 1))
-            print(f"  → {n} rows written to {args.output}\n")
+            n = scrape(args.stations, args.hours, args.output, append=(run > 1))
+            print(f"  → {n} rows total written\n")
             time.sleep(args.loop * 60)
     else:
-        print()
-        n = scrape_to_csv(args.stations, args.output)
+        n = scrape(args.stations, args.hours, args.output, append=False)
         print(f"\nDone! {n} rows written to {args.output}")
 
 
